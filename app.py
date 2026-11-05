@@ -19,6 +19,7 @@ Environment Variables:
   - PROXY_URL: Optional proxy (e.g., http://user:pass@host:port)
   - API_KEY: Optional shared key required in X-API-Key for API endpoints
   - ALLOWED_ORIGINS: Comma-separated CORS origins (default: https://animeheaven.me)
+  - MIN_VIDEO_SIZE_BYTES: Minimum accepted source size (default: 1000000)
   - SELENIUM_ENABLED: Set to "true" to enable Selenium fallback (default: false)
   - CHROME_BINARY: Path to Chrome/Chromium binary (optional)
   - RAILWAY_ENVIRONMENT: Auto-detected for Railway deployments
@@ -95,6 +96,7 @@ SEARCH_URL = f"{BASE_URL}/search.php"
 PROXY_URL = os.environ.get("PROXY_URL", "")
 API_KEY = os.environ.get("API_KEY", "").strip()
 ALLOWED_ORIGINS = [origin.strip() for origin in os.environ.get("ALLOWED_ORIGINS", "https://animeheaven.me").split(",") if origin.strip()]
+MIN_VIDEO_SIZE_BYTES = int(os.environ.get("MIN_VIDEO_SIZE_BYTES", "1000000"))
 REQUEST_TIMEOUT = 30
 RETRY_ATTEMPTS = 3
 RETRY_DELAY = 3
@@ -337,29 +339,26 @@ def get_episode_list(session: SessionManager, anime_id: str) -> List[Dict]:
 
 def extract_urls_from_gate_html(html: str) -> Tuple[Optional[str], Optional[str]]:
     """Parse gate.php HTML to extract stream and download URLs."""
+    # AnimeHeaven keeps a small fallback source inside an HTML comment. It is
+    # a shared placeholder and must never be selected over the active source.
+    html = re.sub(r"<!--.*?-->", "", html, flags=re.DOTALL)
     stream_url = None
     download_url = None
-
-    # Stream URL: first <source> tag with type='video/mp4' and onerror="xhr()"
-    source_patterns = [
-        r"<source\s+src='(https?://[^'\"]+\.animeheaven\.me/video\.mp4\?[^'\"&]+&[^'\"]+)'\s+type='video/mp4'\s+onerror=\"xhr\(\)\">",
-        r"<source\s+src='(https?://[^'\"]+\.animeheaven\.me/video\.mp4\?[^'\"]+)'\s+type='video/mp4'",
-    ]
-    for pat in source_patterns:
-        m = re.search(pat, html)
-        if m:
-            stream_url = m.group(1)
+    soup = BeautifulSoup(html, "lxml")
+    # The first active source is the primary stream. Later sources are error
+    # fallbacks (&error and &error2) and must not be selected.
+    for source in soup.find_all("source"):
+        candidate = source.get("src", "")
+        if (candidate.startswith("https://") and ".animeheaven.me/video.mp4?" in candidate
+                and "&error" not in candidate):
+            stream_url = candidate
             break
-
     # Download URL: link with &d suffix
-    download_patterns = [
-        r"<a\s+href='(https?://[^'\"]+\.animeheaven\.me/video\.mp4\?[^'\"]+&d)'",
-        r'href=["\'](https?://[^"\']+\.animeheaven\.me/video\.mp4\?[^"\']+&d)["\']',
-    ]
-    for pat in download_patterns:
-        m = re.search(pat, html)
-        if m:
-            download_url = m.group(1)
+    for link in soup.find_all("a", href=True):
+        candidate = link["href"]
+        if (candidate.startswith("https://") and ".animeheaven.me/video.mp4?" in candidate
+                and candidate.endswith("&d")):
+            download_url = candidate
             break
 
     # Fallback: construct download from stream
@@ -474,6 +473,12 @@ def extract_video_source(
         check_resp.close()
     except Exception as e:
         logger.warning(f"Could not verify URL: {e}")
+
+    if not size_bytes or size_bytes < MIN_VIDEO_SIZE_BYTES:
+        raise Exception(
+            f"Video source appears to be a placeholder or unavailable "
+            f"(size_bytes={size_bytes}, minimum={MIN_VIDEO_SIZE_BYTES})"
+        )
 
     return {
         "video_url": selected_url,
